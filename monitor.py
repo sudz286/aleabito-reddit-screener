@@ -798,11 +798,35 @@ def send_telegram(message: str):
 
 # ── Main Loop ─────────────────────────────────────────────────────────────────
 
-def run_once(backfill: int = 20):
-    """Single poll: fetch, process, deliver."""
+def run_once(backfill: int = 20, since: str = None, until: str = None):
+    """Single poll: fetch, process, deliver.
+
+    since / until: ISO date strings e.g. "2026-01-01" or "2026-01-01T00:00:00Z"
+    When provided, tweets outside the window are skipped (client-side filter,
+    works for all sources). The X API source also passes since/until server-side.
+    """
     tweets = fetch_tweets(limit=backfill, since_id=get_last_tweet_id())
     if not tweets:
         log.info("No new tweets found")
+        return
+
+    # Client-side date window filter
+    if since or until:
+        def in_window(t):
+            ts = t.get("time", "")
+            if not ts:
+                return True  # no timestamp, keep it
+            if since and ts < since:
+                return False
+            if until and ts > until:
+                return False
+            return True
+        before = len(tweets)
+        tweets = [t for t in tweets if in_window(t)]
+        log.info(f"Date filter [{since} → {until}]: {before} → {len(tweets)} tweets")
+
+    if not tweets:
+        log.info("No tweets in the specified date window")
         return
 
     new_signals = 0
@@ -842,6 +866,10 @@ def main():
     parser.add_argument("--daemon", action="store_true", help="Run continuously")
     parser.add_argument("--backfill", type=int, default=20, help="Tweets to fetch")
     parser.add_argument("--source", choices=["rsshub", "x_api", "apify"], help="Override tweet source")
+    parser.add_argument("--since", type=str, default=None,
+                        help="Only process tweets on/after this date (ISO format, e.g. 2026-01-01)")
+    parser.add_argument("--until", type=str, default=None,
+                        help="Only process tweets on/before this date (ISO format, e.g. 2026-05-01)")
     args = parser.parse_args()
 
     if args.source:
@@ -852,7 +880,7 @@ def main():
     if args.daemon:
         run_daemon()
     else:
-        run_once(backfill=args.backfill)
+        run_once(backfill=args.backfill, since=args.since, until=args.until)
 
 
 if __name__ == "__main__":

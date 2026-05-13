@@ -1,29 +1,107 @@
 # X Signal Monitor
 
-Polls [@aleabitoreddit](https://x.com/aleabitoreddit) for finance tweets, extracts global tickers with prices, and delivers simplified thesis summaries to Telegram.
+Polls [@aleabitoreddit](https://x.com/aleabitoreddit) for finance tweets, extracts global tickers with prices, and serves a local dashboard with thesis summaries and performance tracking.
 
 ## Architecture
 
 ```
-RSSHub (free)              yfinance (free, global)
-     |                            |
-     v                            v
- Tweet Ingestion ──> Ticker Extraction ──> Price Resolution
-                                                |
-                                                v
-                                    Claude API (thesis summary)
-                                                |
-                                                v
-                                        Telegram Delivery
+Apify (tweet scraper)
+        |
+        v
+   Tweet Ingestion ──> SQLite (tweets, signals, ticker_mentions)
+        |
+        v
+  Two-pass Ticker Resolution
+    Pass 1: $TICKER regex → yfinance
+    Pass 2: Claude company_names[] → Yahoo Finance search → yfinance
+        |
+        v
+   Claude API (thesis summary, sentiment, confidence, company names)
+        |
+        v
+   FastAPI Dashboard  ←──  APScheduler (price refresh every 30 min)
 ```
 
 ## Pipeline per tweet
 
-1. **Ingest** - Pull tweet text, detect if it's a reply, grab parent context
-2. **Extract** - Regex for `$TICKER` patterns, filter false positives
-3. **Resolve** - Scan tweet for country/exchange hints (e.g. "Korea", "KOSPI"), try yfinance with appropriate suffixes (`.KS`, `.T`, `.PA`, etc.)
-4. **Summarize** - Send tweet + ticker data to Claude, get back plain-English thesis and market context
-5. **Deliver** - Format and push to Telegram (falls back to stdout if not configured)
+1. **Ingest** — Apify scrapes tweets from @aleabitoreddit; SQLite deduplication by tweet ID
+2. **Resolve (Pass 1)** — Regex for `$TICKER` patterns → yfinance validation
+3. **Summarize** — Claude returns thesis summary, market context, sentiment, confidence, and `company_names[]`
+4. **Resolve (Pass 2)** — Each company name → Yahoo Finance search → yfinance validation; merged with Pass 1 results
+5. **Persist** — Signals and ticker mentions saved to SQLite with price at mention
+6. **Dashboard** — FastAPI serves feed + leaderboard views; prices refreshed every 30 min in background
+
+## Setup
+
+```bash
+git clone <repo>
+cd aleabitoreddit-screener
+
+pip install -r requirements.txt
+
+cp .env.example .env
+# Fill in: ANTHROPIC_API_KEY, APIFY_API_TOKEN
+```
+
+`.env` keys:
+
+| Key | Required | Description |
+|-----|----------|-------------|
+| `ANTHROPIC_API_KEY` | Yes | Claude API key |
+| `APIFY_API_TOKEN` | Yes | Apify account token |
+| `APIFY_ACTOR_ID` | No | Default: `apidojo/tweet-scraper` |
+| `TWEET_SOURCE` | No | `apify` (default), `rsshub`, `x_api` |
+| `TWITTER_USERNAME` | No | Target account (default: `aleabitoreddit`) |
+
+## Usage
+
+### Run the monitor (fetch + process tweets)
+
+```bash
+# Latest tweets (default: most recent run)
+python monitor.py
+
+# Backfill last N tweets
+python monitor.py --backfill 50
+
+# Date-windowed run
+python monitor.py --since 2026-01-01 --until 2026-05-01
+
+# Daemon mode (poll every hour)
+python monitor.py --daemon
+```
+
+### Run the dashboard
+
+```bash
+uvicorn dashboard:app --reload --port 8000
+```
+
+Open `http://localhost:8000` in your browser.
+
+## Dashboard
+
+### Feed view
+- Paginated signal cards (infinite scroll) ordered by recency
+- Right-pane detail: full thesis, market context, sentiment badge, confidence
+- Ticker chips with price at mention and current price
+- Unresolved tickers can be manually resolved via Yahoo Finance search
+
+### Leaderboard view
+- KPI strip: total signals, tickers tracked, best and worst performer
+- Podium cards for top 3 performers
+- Full table sorted by % gain from first mention, with sparklines and mention counts
+
+## Database
+
+SQLite at `state/signals.db`. Tables:
+
+| Table | Purpose |
+|-------|---------|
+| `tweets` | Raw tweet text, URL, timestamps, parent context |
+| `signals` | Claude-generated thesis, sentiment, confidence, `is_finance` flag |
+| `ticker_mentions` | Per-signal tickers with price at mention |
+| `ticker_prices` | Latest prices per symbol; `fail_count` skips bad tickers after 5 failures |
 
 ## Supported Markets
 
@@ -43,72 +121,9 @@ RSSHub (free)              yfinance (free, global)
 | Canada | TSX | `.TO` |
 | Brazil | B3 | `.SA` |
 
-## Setup
-
-```bash
-# Clone / copy files
-cd x_signal_monitor
-
-# Install deps
-pip install -r requirements.txt
-
-# Configure
-cp .env.example .env
-# Edit .env with your API keys
-
-# Load env vars (or use python-dotenv)
-export $(grep -v '^#' .env | xargs)
-```
-
-## Self-hosting RSSHub (recommended)
-
-Public RSSHub instances can be unreliable. Self-host for stability:
-
-```bash
-# Docker (simplest)
-docker run -d --name rsshub -p 1200:1200 diygod/rsshub
-
-# Then set RSSHUB_BASE=http://localhost:1200
-```
-
-## Usage
-
-```bash
-# One-shot: fetch and process latest tweets
-python monitor.py
-
-# Backfill last 50 tweets
-python monitor.py --backfill 50
-
-# Daemon mode: poll every hour continuously
-python monitor.py --daemon
-
-# Override tweet source
-python monitor.py --source x_api
-```
-
-## Example Output (Telegram)
+## Requirements
 
 ```
-📡 New Signal
-
-Tickers:
-  $005930 Samsung Electronics — KRW 82400 (+1.23%)
-  $ASML ASML Holding — EUR 723.50 (-0.45%)
-
-Market: Korean/European semiconductor equipment supply chain
-
-Thesis: Samsung is ramping up its advanced chip manufacturing
-and increasing orders from ASML for their latest lithography
-machines. The bet is that Samsung will close the gap with TSMC,
-which would be good for both companies' stock prices.
-
-View tweet: https://x.com/aleabitoreddit/status/...
+requests, feedparser, yfinance, anthropic, python-dotenv,
+apify-client, fastapi, uvicorn, apscheduler, python-multipart
 ```
-
-## Extending
-
-- **Add WhatsApp**: swap `send_telegram()` for Twilio WhatsApp API
-- **Add more accounts**: pass `--username` flag or loop over a list
-- **Store signals**: write Signal objects to SQLite/Postgres for backtesting
-- **Dashboard**: feed JSON signals to a simple React frontend

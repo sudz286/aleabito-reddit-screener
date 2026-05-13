@@ -13,7 +13,9 @@
             <button class="nav-btn active" id="btn-feed" onclick="showView('feed')">Feed</button>
             <button class="nav-btn" id="btn-leaderboard" onclick="showView('leaderboard')">Leaderboard</button>
         </div>
-        <button class="refresh-btn" id="refresh-btn" onclick="manualRefresh()">↻ Refresh Prices</button>
+        <div class="nav-spacer"></div>
+        <span class="nav-meta" id="nav-meta"></span>
+        <button class="refresh-btn" id="refresh-btn" onclick="manualRefresh()">Refresh prices</button>
     </nav>
 
     <!-- Feed View -->
@@ -25,7 +27,7 @@
             </div>
             <div class="pane-right" id="signal-detail">
                 <div class="detail-empty">
-                    <p>← Select a signal to view details</p>
+                    Select a signal to view the full thesis →
                 </div>
             </div>
         </div>
@@ -34,10 +36,6 @@
     <!-- Leaderboard View -->
     <div class="view hidden" id="view-leaderboard">
         <div class="leaderboard-wrap">
-            <div class="lb-header">
-                <h2>Ticker Leaderboard</h2>
-                <span class="lb-sub">Sorted by % gain since first mention · prices refresh every 30 min</span>
-            </div>
             <div id="leaderboard-container"></div>
         </div>
     </div>

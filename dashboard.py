@@ -406,14 +406,29 @@ async def resolve_ticker(ticker_id: int, body: ResolveBody):
         raise HTTPException(422, f"Validation failed: {e}")
 
     with get_db() as conn:
-        if not conn.execute("SELECT 1 FROM ticker_mentions WHERE id = ?", (ticker_id,)).fetchone():
+        row = conn.execute("SELECT symbol FROM ticker_mentions WHERE id = ?", (ticker_id,)).fetchone()
+        if not row:
             raise HTTPException(404, "Ticker mention not found")
+
+        raw_symbol = row["symbol"]
+
+        # Apply to ALL unresolved mentions of the same raw symbol across the entire DB
+        updated = conn.execute("""
+            UPDATE ticker_mentions
+            SET resolved_symbol=?, name=?, exchange=?, currency=?,
+                price_at_mention=COALESCE(price_at_mention, ?),
+                price_fetched_at=datetime('now')
+            WHERE symbol=? AND name='(unresolved)'
+        """, (symbol, name, exchange, currency, round(price, 4), raw_symbol)).rowcount
+
+        # Also update the specific row even if it was already partially resolved
         conn.execute("""
             UPDATE ticker_mentions
             SET resolved_symbol=?, name=?, exchange=?, currency=?,
-                price_at_mention=?, price_fetched_at=datetime('now')
+                price_fetched_at=datetime('now')
             WHERE id=?
-        """, (symbol, name, exchange, currency, round(price, 4), ticker_id))
+        """, (symbol, name, exchange, currency, ticker_id))
+
         conn.execute("""
             INSERT INTO ticker_prices (resolved_symbol, current_price, currency, last_updated)
             VALUES (?, ?, ?, datetime('now'))
@@ -422,7 +437,8 @@ async def resolve_ticker(ticker_id: int, body: ResolveBody):
                 last_updated  = excluded.last_updated
         """, (symbol, round(price, 4), currency))
 
-    return {"resolved_symbol": symbol, "name": name, "price": round(price, 4), "currency": currency}
+    log.info(f"Resolved {raw_symbol!r} → {symbol} across {updated} mention(s)")
+    return {"resolved_symbol": symbol, "name": name, "price": round(price, 4), "currency": currency, "mentions_updated": updated}
 
 
 # ── API: manual price refresh ─────────────────────────────────────────────────
