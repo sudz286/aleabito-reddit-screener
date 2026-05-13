@@ -1,0 +1,47 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Signal Monitor</title>
+    <link rel="stylesheet" href="/static/app.css" />
+</head>
+<body>
+    <nav class="navbar">
+        <span class="nav-brand">Signal Monitor</span>
+        <div class="nav-links">
+            <button class="nav-btn active" id="btn-feed" onclick="showView('feed')">Feed</button>
+            <button class="nav-btn" id="btn-leaderboard" onclick="showView('leaderboard')">Leaderboard</button>
+        </div>
+        <button class="refresh-btn" id="refresh-btn" onclick="manualRefresh()">↻ Refresh Prices</button>
+    </nav>
+
+    <!-- Feed View -->
+    <div class="view" id="view-feed">
+        <div class="feed-layout">
+            <div class="pane-left" id="pane-left">
+                <div id="signals-container"></div>
+                <div id="signals-sentinel"></div>
+            </div>
+            <div class="pane-right" id="signal-detail">
+                <div class="detail-empty">
+                    <p>← Select a signal to view details</p>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Leaderboard View -->
+    <div class="view hidden" id="view-leaderboard">
+        <div class="leaderboard-wrap">
+            <div class="lb-header">
+                <h2>Ticker Leaderboard</h2>
+                <span class="lb-sub">Sorted by % gain since first mention · prices refresh every 30 min</span>
+            </div>
+            <div id="leaderboard-container"></div>
+        </div>
+    </div>
+
+    <script src="/static/app.js"></script>
+</body>
+</html>
