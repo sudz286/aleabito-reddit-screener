@@ -22,6 +22,7 @@ document.addEventListener('DOMContentLoaded', () => {
 
 // ── View switching ────────────────────────────────────────────────────────────
 function showView(name) {
+    closeTickerOverlay();
     document.querySelectorAll('.view').forEach(v => v.classList.add('hidden'));
     document.querySelectorAll('.nav-btn').forEach(b => b.classList.remove('active'));
     document.getElementById(`view-${name}`).classList.remove('hidden');
@@ -88,12 +89,13 @@ function renderSignalCard(signal) {
 
     const sentiment = (signal.sentiment || 'neutral').toLowerCase();
 
-    // Render chips for both resolved and unresolved (mark unresolved with class)
+    // Render chips — show new badge on first mention, but not clickable in feed
     const chips = (signal.tickers || [])
         .slice(0, 6)
         .map(t => {
             const isUnresolved = t.name === '(unresolved)';
-            return `<span class="ticker-chip${isUnresolved ? ' unresolved' : ''}">${esc(t.symbol)}</span>`;
+            const isNew = t.is_new && !isUnresolved;
+            return `<span class="ticker-chip${isUnresolved ? ' unresolved' : ''}${isNew ? ' new-mention' : ''}">${esc(t.symbol)}${isNew ? '<span class="chip-new">new</span>' : ''}</span>`;
         })
         .join('');
 
@@ -123,6 +125,7 @@ async function selectSignal(tweetId, cardEl) {
 
     const pane = document.getElementById('signal-detail');
     pane.innerHTML = '<div class="loading">Loading…</div>';
+    pane.classList.add('mobile-open');
 
     try {
         const res = await fetch(`/api/signals/${tweetId}`);
@@ -132,6 +135,10 @@ async function selectSignal(tweetId, cardEl) {
     } catch {
         pane.innerHTML = '<div class="empty-state">Failed to load signal detail.</div>';
     }
+}
+
+function closeMobileDetail() {
+    document.getElementById('signal-detail').classList.remove('mobile-open');
 }
 
 function buildDetail(d) {
@@ -154,6 +161,7 @@ function buildDetail(d) {
         </div>` : '';
 
     return `
+        <button class="mobile-detail-back" onclick="closeMobileDetail()">← All signals</button>
         <div class="detail-header">
             <div class="detail-meta">
                 <span class="sentiment-badge badge-${sentiment}">${sentiment}</span>
@@ -279,23 +287,97 @@ async function pickResolution(id, symbol) {
             results.innerHTML = `<div style="padding:10px 14px;color:var(--bear);font-size:12.5px">Error: ${esc(err.detail)}</div>`;
             return;
         }
-        const data = await res.json();
-        document.getElementById(`trow-${id}`).outerHTML = buildTickerRow({
-            id,
-            symbol: data.resolved_symbol,
-            resolved_symbol: data.resolved_symbol,
-            name: data.name,
-            exchange: '',
-            currency: data.currency || '',
-            price_at_mention: data.price,
-            current_price: data.price,
-            pct_change: 0,
-            is_unresolved: false,
-        });
         showToast(`Resolved → ${symbol}`);
+        // Reload the full detail so deduped rows are removed cleanly
+        const activeCard = document.querySelector(`[data-tweet-id="${activeSignalId}"]`);
+        await selectSignal(activeSignalId, activeCard);
     } catch {
         results.innerHTML = '<div style="padding:10px 14px;color:var(--bear);font-size:12.5px">Failed</div>';
     }
+}
+
+// ── Ticker overlay (leaderboard drill-down) ───────────────────────────────────
+function overlayEscHandler(e) { if (e.key === 'Escape') closeTickerOverlay(); }
+
+async function showTickerDetail(symbol) {
+    const overlay  = document.getElementById('ticker-overlay');
+    const body     = document.getElementById('ticker-overlay-body');
+    const symEl    = document.getElementById('overlay-sym');
+    symEl.textContent = symbol;
+    body.innerHTML = '<div class="loading">Loading…</div>';
+    overlay.style.display = 'flex';
+    document.addEventListener('keydown', overlayEscHandler);
+    try {
+        const res = await fetch(`/api/tickers/${encodeURIComponent(symbol)}/signals`);
+        if (!res.ok) throw new Error();
+        const data = await res.json();
+        symEl.textContent = data.name ? `${data.symbol} · ${data.name}` : data.symbol;
+        body.innerHTML = buildOverlayContent(data);
+    } catch {
+        body.innerHTML = '<div class="empty-state">Failed to load ticker history.</div>';
+    }
+}
+
+function closeTickerOverlay() {
+    document.getElementById('ticker-overlay').style.display = 'none';
+    document.removeEventListener('keydown', overlayEscHandler);
+}
+
+function buildOverlayContent(data) {
+    const cp = data.current_price != null
+        ? `${data.currency || ''} ${fmt(data.current_price)}` : '—';
+
+    const withPrice = data.signals.filter(s => s.price_at_mention != null);
+    const firstPrice = withPrice.length ? withPrice[withPrice.length - 1].price_at_mention : null;
+    let overallPctHtml = '';
+    if (firstPrice && data.current_price && firstPrice > 0) {
+        const pct = (data.current_price - firstPrice) / firstPrice * 100;
+        const cls = pct >= 0 ? 'price-pos' : 'price-neg';
+        overallPctHtml = `<span class="${cls}" style="font-size:14px;font-weight:600;font-family:'IBM Plex Mono',monospace">${pct >= 0 ? '+' : ''}${pct.toFixed(2)}% since first mention</span>`;
+    }
+
+    const rows = data.signals.map(s => {
+        const sentiment = (s.sentiment || 'neutral').toLowerCase();
+        const mp = s.price_at_mention != null
+            ? `${s.currency || ''} ${fmt(s.price_at_mention)}` : '—';
+        let pctHtml = '';
+        if (s.price_at_mention && data.current_price && s.price_at_mention > 0) {
+            const pct = (data.current_price - s.price_at_mention) / s.price_at_mention * 100;
+            const cls = pct >= 0 ? 'price-pos' : 'price-neg';
+            pctHtml = `<span class="${cls}">${pct >= 0 ? '▲' : '▼'} ${Math.abs(pct).toFixed(2)}%</span>`;
+        }
+        const viewLink = s.tweet_url
+            ? `<a class="tweet-link" href="${esc(s.tweet_url)}" target="_blank" rel="noopener noreferrer" style="margin-left:auto;font-size:11.5px">View tweet ↗</a>`
+            : '';
+        return `
+        <div class="tsr-row">
+            <div class="tsr-meta">
+                <span class="sentiment-badge badge-${sentiment}">${sentiment}</span>
+                ${s.confidence ? `<span class="confidence-badge">${esc(s.confidence)}</span>` : ''}
+                <span class="tsr-time">${fmtDate(s.published_at)}</span>
+            </div>
+            ${s.thesis_summary ? `<div class="tsr-thesis">${esc(s.thesis_summary)}</div>` : ''}
+            <div class="tsr-price">
+                <span>@ mention: <b>${mp}</b></span>
+                ${pctHtml}
+                ${viewLink}
+            </div>
+        </div>`;
+    }).join('');
+
+    return `
+    <div class="ticker-view-header">
+        <div class="ticker-view-sym">${esc(data.symbol)}</div>
+        <div class="ticker-view-name">${esc(data.name || '')}</div>
+        <div class="ticker-view-meta" style="flex-wrap:wrap;gap:14px;margin-top:10px">
+            ${data.exchange ? `<span class="t-exchange">${esc(data.exchange)}</span>` : ''}
+            <span class="ticker-view-price">${cp}</span>
+            ${overallPctHtml}
+        </div>
+    </div>
+    <div class="ticker-view-count" style="margin-top:4px">${data.signals.length} mention${data.signals.length === 1 ? '' : 's'}</div>
+    <div class="ticker-signals-list" style="margin-top:8px">${rows}</div>
+    `;
 }
 
 // ── Leaderboard ───────────────────────────────────────────────────────────────
@@ -453,7 +535,7 @@ function renderPodium(entries) {
             return `
             <div class="podium-card">
                 <span class="podium-rank">0${i + 1}</span>
-                <div class="podium-sym">${esc(e.resolved_symbol)}</div>
+                <div class="podium-sym podium-sym-link" onclick="showTickerDetail('${escAttr(e.resolved_symbol)}')">${esc(e.resolved_symbol)}</div>
                 <div class="podium-name">${esc(e.name || '')}</div>
                 <div class="podium-bottom">
                     <span class="podium-gain ${dir}">${e.pct_from_first >= 0 ? '+' : ''}${e.pct_from_first.toFixed(1)}%</span>
@@ -492,9 +574,9 @@ function renderLbTable(entries) {
         <tr>
             <td class="lb-rank">${String(i + 1).padStart(2, '0')}</td>
             <td>
-                <div class="lb-symbol">
+                <div class="lb-symbol lb-symbol-link" onclick="showTickerDetail('${escAttr(e.resolved_symbol)}')">
                     <span class="sent-dot ${sentClass(e)}"></span>
-                    ${esc(e.resolved_symbol)}
+                    <span class="lb-sym-text">${esc(e.resolved_symbol)}</span>
                 </div>
                 <div class="lb-name" title="${escAttr(e.name)}">${esc(e.name || '')}</div>
             </td>
@@ -505,7 +587,7 @@ function renderLbTable(entries) {
             <td>${gainCell(e.pct_from_first, maxAbsFirst)}</td>
             <td>${gainCell(e.pct_from_last,  maxAbsLast)}</td>
             <td class="lb-count">${e.mention_count}×</td>
-            <td class="lb-date">${fmtDateShort(e.last_posted)}</td>
+            <td class="lb-date">${fmtDateShort(e.first_posted)}</td>
         </tr>`;
     }).join('');
 
@@ -528,7 +610,7 @@ function renderLbTable(entries) {
                 <th class="r ${sortClass('pct_from_first')}" data-sortkey="pct_from_first">From first ${sortInd('pct_from_first')}</th>
                 <th class="r ${sortClass('pct_from_last')}"  data-sortkey="pct_from_last">From last ${sortInd('pct_from_last')}</th>
                 <th class="r ${sortClass('mention_count')}"  data-sortkey="mention_count">Mentions ${sortInd('mention_count')}</th>
-                <th class="r ${sortClass('last_posted')}"    data-sortkey="last_posted">Last mentioned ${sortInd('last_posted')}</th>
+                <th class="r ${sortClass('first_posted')}"   data-sortkey="first_posted">First mentioned ${sortInd('first_posted')}</th>
             </tr></thead>
             <tbody>${rows}</tbody>
         </table>

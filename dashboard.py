@@ -6,7 +6,6 @@ Usage:
 """
 
 import logging
-import sqlite3
 import concurrent.futures
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -20,6 +19,7 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from pydantic import BaseModel
 from dotenv import load_dotenv
+from db import get_db, dict_cursor, db_now
 
 load_dotenv()
 
@@ -27,7 +27,6 @@ log = logging.getLogger("dashboard")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logging.getLogger("yfinance").setLevel(logging.CRITICAL)  # suppress yfinance noise
 
-DB_FILE = Path(__file__).parent / "state" / "signals.db"
 STATIC_DIR = Path(__file__).parent / "static"
 TEMPLATES_DIR = Path(__file__).parent / "templates"
 
@@ -35,34 +34,28 @@ STATIC_DIR.mkdir(exist_ok=True)
 TEMPLATES_DIR.mkdir(exist_ok=True)
 
 
-# ── DB ────────────────────────────────────────────────────────────────────────
+# ── Schema ────────────────────────────────────────────────────────────────────
 
-def get_db() -> sqlite3.Connection:
-    conn = sqlite3.connect(str(DB_FILE))
-    conn.row_factory = sqlite3.Row
-    return conn
-
-
-PRICE_FETCH_TIMEOUT = 8    # seconds per ticker before we give up
-MAX_TICKER_FAILURES = 5   # stop retrying after this many consecutive failures
+PRICE_FETCH_TIMEOUT = 8
+MAX_TICKER_FAILURES = 5
 
 
 def ensure_schema():
     with get_db() as conn:
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS ticker_prices (
-                resolved_symbol TEXT PRIMARY KEY,
-                current_price   REAL,
-                currency        TEXT,
-                last_updated    TEXT DEFAULT (datetime('now')),
-                fail_count      INTEGER DEFAULT 0
-            )
-        """)
-        # safe migration: add fail_count if upgrading from older schema
-        try:
-            conn.execute("ALTER TABLE ticker_prices ADD COLUMN fail_count INTEGER DEFAULT 0")
-        except Exception:
-            pass
+        with dict_cursor(conn) as cur:
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS ticker_prices (
+                    resolved_symbol TEXT PRIMARY KEY,
+                    current_price   REAL,
+                    currency        TEXT,
+                    last_updated    TEXT,
+                    fail_count      INTEGER DEFAULT 0
+                )
+            """)
+            cur.execute("""
+                ALTER TABLE ticker_prices
+                ADD COLUMN IF NOT EXISTS fail_count INTEGER DEFAULT 0
+            """)
 
 
 # ── Price refresh ─────────────────────────────────────────────────────────────
@@ -75,18 +68,20 @@ def _fetch_price(symbol: str):
 
 def _do_refresh_prices():
     with get_db() as conn:
-        rows = conn.execute("""
-            SELECT DISTINCT tm.resolved_symbol, tm.currency,
-                   COALESCE(tp.fail_count, 0) AS fail_count
-            FROM ticker_mentions tm
-            LEFT JOIN ticker_prices tp ON tm.resolved_symbol = tp.resolved_symbol
-            WHERE tm.resolved_symbol IS NOT NULL
-              AND tm.resolved_symbol != ''
-              AND tm.name != '(unresolved)'
-              AND COALESCE(tp.fail_count, 0) < ?
-        """, (MAX_TICKER_FAILURES,)).fetchall()
+        with dict_cursor(conn) as cur:
+            cur.execute("""
+                SELECT DISTINCT tm.resolved_symbol, tm.currency,
+                       COALESCE(tp.fail_count, 0) AS fail_count
+                FROM ticker_mentions tm
+                LEFT JOIN ticker_prices tp ON tm.resolved_symbol = tp.resolved_symbol
+                WHERE tm.resolved_symbol IS NOT NULL
+                  AND tm.resolved_symbol != ''
+                  AND tm.name != '(unresolved)'
+                  AND COALESCE(tp.fail_count, 0) < %s
+            """, (MAX_TICKER_FAILURES,))
+            rows = cur.fetchall()
 
-    skipped = len(rows)  # will subtract as we process
+    skipped = len(rows)
     updated = 0
     failed  = 0
 
@@ -104,25 +99,26 @@ def _do_refresh_prices():
 
         if price and price > 0:
             with get_db() as conn:
-                conn.execute("""
-                    INSERT INTO ticker_prices (resolved_symbol, current_price, currency, last_updated, fail_count)
-                    VALUES (?, ?, ?, datetime('now'), 0)
-                    ON CONFLICT(resolved_symbol) DO UPDATE SET
-                        current_price = excluded.current_price,
-                        last_updated  = excluded.last_updated,
-                        fail_count    = 0
-                """, (symbol, round(price, 4), row["currency"] or ""))
+                with dict_cursor(conn) as cur:
+                    cur.execute("""
+                        INSERT INTO ticker_prices (resolved_symbol, current_price, currency, last_updated, fail_count)
+                        VALUES (%s, %s, %s, %s, 0)
+                        ON CONFLICT (resolved_symbol) DO UPDATE SET
+                            current_price = EXCLUDED.current_price,
+                            last_updated  = EXCLUDED.last_updated,
+                            fail_count    = 0
+                    """, (symbol, round(price, 4), row["currency"] or "", db_now()))
             updated += 1
         else:
-            # Increment failure counter; at MAX_TICKER_FAILURES this ticker is silently skipped
             with get_db() as conn:
-                conn.execute("""
-                    INSERT INTO ticker_prices (resolved_symbol, currency, fail_count, last_updated)
-                    VALUES (?, ?, 1, datetime('now'))
-                    ON CONFLICT(resolved_symbol) DO UPDATE SET
-                        fail_count   = fail_count + 1,
-                        last_updated = excluded.last_updated
-                """, (symbol, row["currency"] or ""))
+                with dict_cursor(conn) as cur:
+                    cur.execute("""
+                        INSERT INTO ticker_prices (resolved_symbol, currency, fail_count, last_updated)
+                        VALUES (%s, %s, 1, %s)
+                        ON CONFLICT (resolved_symbol) DO UPDATE SET
+                            fail_count   = ticker_prices.fail_count + 1,
+                            last_updated = EXCLUDED.last_updated
+                    """, (symbol, row["currency"] or "", db_now()))
             failed += 1
             if row["fail_count"] + 1 >= MAX_TICKER_FAILURES:
                 log.warning(f"Ticker {symbol} failed {MAX_TICKER_FAILURES} times — skipping permanently")
@@ -163,43 +159,62 @@ async def index(request: Request):
     return templates.TemplateResponse(request=request, name="index.html")
 
 
+@app.get("/tickers/{symbol}", response_class=HTMLResponse)
+async def ticker_page(request: Request, symbol: str):
+    return templates.TemplateResponse(
+        request=request, name="ticker.html",
+        context={"symbol": symbol.upper()},
+    )
+
+
 # ── API: signals list ─────────────────────────────────────────────────────────
 
 @app.get("/api/signals")
 async def list_signals(page: int = 1, per_page: int = 30):
     offset = (page - 1) * per_page
     with get_db() as conn:
-        rows = conn.execute("""
-            SELECT s.id, s.tweet_id, s.thesis_summary, s.market_context,
-                   s.sentiment, s.confidence,
-                   t.text AS tweet_text, t.url AS tweet_url,
-                   t.published_at, t.is_reply
-            FROM signals s
-            JOIN tweets t ON s.tweet_id = t.id
-            WHERE s.is_finance = 1
-            ORDER BY t.published_at DESC
-            LIMIT ? OFFSET ?
-        """, (per_page, offset)).fetchall()
+        with dict_cursor(conn) as cur:
+            cur.execute("""
+                SELECT s.id, s.tweet_id, s.thesis_summary, s.market_context,
+                       s.sentiment, s.confidence,
+                       t.text AS tweet_text, t.url AS tweet_url,
+                       t.published_at, t.is_reply
+                FROM signals s
+                JOIN tweets t ON s.tweet_id = t.id
+                WHERE s.is_finance = 1
+                ORDER BY t.published_at DESC
+                LIMIT %s OFFSET %s
+            """, (per_page, offset))
+            rows = cur.fetchall()
 
-        total = conn.execute(
-            "SELECT COUNT(*) FROM signals WHERE is_finance = 1"
-        ).fetchone()[0]
+            cur.execute("SELECT COUNT(*) FROM signals WHERE is_finance = 1")
+            total = cur.fetchone()["count"]
 
-        signal_ids = [r["id"] for r in rows]
-        ticker_rows = []
-        if signal_ids:
-            placeholders = ",".join("?" * len(signal_ids))
-            ticker_rows = conn.execute(f"""
-                SELECT signal_id, resolved_symbol, name
-                FROM ticker_mentions
-                WHERE signal_id IN ({placeholders})
-            """, signal_ids).fetchall()
+            signal_ids = [r["id"] for r in rows]
+            ticker_rows = []
+            first_mention_map: dict[str, int] = {}
+            if signal_ids:
+                cur.execute("""
+                    SELECT signal_id, resolved_symbol, name
+                    FROM ticker_mentions
+                    WHERE signal_id = ANY(%s)
+                """, (signal_ids,))
+                ticker_rows = cur.fetchall()
+
+                cur.execute("""
+                    SELECT resolved_symbol, MIN(signal_id) AS first_signal_id
+                    FROM ticker_mentions
+                    WHERE resolved_symbol IS NOT NULL AND resolved_symbol != ''
+                    GROUP BY resolved_symbol
+                """)
+                first_mention_map = {r["resolved_symbol"]: r["first_signal_id"] for r in cur.fetchall()}
 
     tickers_by_signal: dict[int, list] = {}
     for tr in ticker_rows:
         tickers_by_signal.setdefault(tr["signal_id"], []).append({
             "symbol": tr["resolved_symbol"],
             "name": tr["name"],
+            "is_new": tr["signal_id"] == first_mention_map.get(tr["resolved_symbol"]),
         })
 
     return {
@@ -230,27 +245,30 @@ async def list_signals(page: int = 1, per_page: int = 30):
 @app.get("/api/signals/{tweet_id}")
 async def get_signal(tweet_id: str):
     with get_db() as conn:
-        sig = conn.execute("""
-            SELECT s.id, s.tweet_id, s.thesis_summary, s.market_context,
-                   s.sentiment, s.confidence,
-                   t.text AS tweet_text, t.url AS tweet_url,
-                   t.published_at, t.is_reply, t.parent_text
-            FROM signals s
-            JOIN tweets t ON s.tweet_id = t.id
-            WHERE s.tweet_id = ?
-        """, (tweet_id,)).fetchone()
+        with dict_cursor(conn) as cur:
+            cur.execute("""
+                SELECT s.id, s.tweet_id, s.thesis_summary, s.market_context,
+                       s.sentiment, s.confidence,
+                       t.text AS tweet_text, t.url AS tweet_url,
+                       t.published_at, t.is_reply, t.parent_text
+                FROM signals s
+                JOIN tweets t ON s.tweet_id = t.id
+                WHERE s.tweet_id = %s
+            """, (tweet_id,))
+            sig = cur.fetchone()
 
-        if not sig:
-            raise HTTPException(404, "Signal not found")
+            if not sig:
+                raise HTTPException(404, "Signal not found")
 
-        tickers = conn.execute("""
-            SELECT tm.id, tm.symbol, tm.resolved_symbol, tm.name,
-                   tm.exchange, tm.currency, tm.price_at_mention, tm.change_pct,
-                   tp.current_price, tp.last_updated AS price_updated_at
-            FROM ticker_mentions tm
-            LEFT JOIN ticker_prices tp ON tm.resolved_symbol = tp.resolved_symbol
-            WHERE tm.signal_id = ?
-        """, (sig["id"],)).fetchall()
+            cur.execute("""
+                SELECT tm.id, tm.symbol, tm.resolved_symbol, tm.name,
+                       tm.exchange, tm.currency, tm.price_at_mention, tm.change_pct,
+                       tp.current_price, tp.last_updated AS price_updated_at
+                FROM ticker_mentions tm
+                LEFT JOIN ticker_prices tp ON tm.resolved_symbol = tp.resolved_symbol
+                WHERE tm.signal_id = %s
+            """, (sig["id"],))
+            tickers = cur.fetchall()
 
     result_tickers = []
     for t in tickers:
@@ -291,33 +309,39 @@ async def get_signal(tweet_id: str):
 @app.get("/api/leaderboard")
 async def get_leaderboard():
     with get_db() as conn:
-        groups = conn.execute("""
-            SELECT tm.resolved_symbol, tm.name, tm.currency,
-                   MIN(t.published_at) AS first_posted,
-                   MAX(t.published_at) AS last_posted,
-                   COUNT(DISTINCT s.tweet_id) AS mention_count,
-                   tp.current_price, tp.last_updated
-            FROM ticker_mentions tm
-            JOIN signals s ON tm.signal_id = s.id
-            JOIN tweets t ON s.tweet_id = t.id
-            LEFT JOIN ticker_prices tp ON tm.resolved_symbol = tp.resolved_symbol
-            WHERE tm.resolved_symbol IS NOT NULL
-              AND tm.resolved_symbol != ''
-              AND tm.name != '(unresolved)'
-              AND s.is_finance = 1
-            GROUP BY tm.resolved_symbol
-        """).fetchall()
+        with dict_cursor(conn) as cur:
+            cur.execute("""
+                SELECT tm.resolved_symbol,
+                       MAX(tm.name) AS name,
+                       MAX(tm.currency) AS currency,
+                       MIN(t.published_at) AS first_posted,
+                       MAX(t.published_at) AS last_posted,
+                       COUNT(DISTINCT s.tweet_id) AS mention_count,
+                       MAX(tp.current_price) AS current_price,
+                       MAX(tp.last_updated) AS last_updated
+                FROM ticker_mentions tm
+                JOIN signals s ON tm.signal_id = s.id
+                JOIN tweets t ON s.tweet_id = t.id
+                LEFT JOIN ticker_prices tp ON tm.resolved_symbol = tp.resolved_symbol
+                WHERE tm.resolved_symbol IS NOT NULL
+                  AND tm.resolved_symbol != ''
+                  AND tm.name != '(unresolved)'
+                  AND s.is_finance = 1
+                GROUP BY tm.resolved_symbol
+            """)
+            groups = cur.fetchall()
 
-        all_prices = conn.execute("""
-            SELECT tm.resolved_symbol, tm.price_at_mention, t.published_at
-            FROM ticker_mentions tm
-            JOIN signals s ON tm.signal_id = s.id
-            JOIN tweets t ON s.tweet_id = t.id
-            WHERE tm.price_at_mention IS NOT NULL
-              AND tm.name != '(unresolved)'
-              AND s.is_finance = 1
-            ORDER BY t.published_at ASC
-        """).fetchall()
+            cur.execute("""
+                SELECT tm.resolved_symbol, tm.price_at_mention, t.published_at
+                FROM ticker_mentions tm
+                JOIN signals s ON tm.signal_id = s.id
+                JOIN tweets t ON s.tweet_id = t.id
+                WHERE tm.price_at_mention IS NOT NULL
+                  AND tm.name != '(unresolved)'
+                  AND s.is_finance = 1
+                ORDER BY t.published_at ASC
+            """)
+            all_prices = cur.fetchall()
 
     first_price: dict[str, float] = {}
     last_price: dict[str, float] = {}
@@ -406,39 +430,106 @@ async def resolve_ticker(ticker_id: int, body: ResolveBody):
         raise HTTPException(422, f"Validation failed: {e}")
 
     with get_db() as conn:
-        row = conn.execute("SELECT symbol FROM ticker_mentions WHERE id = ?", (ticker_id,)).fetchone()
-        if not row:
-            raise HTTPException(404, "Ticker mention not found")
+        with dict_cursor(conn) as cur:
+            cur.execute("SELECT symbol FROM ticker_mentions WHERE id = %s", (ticker_id,))
+            row = cur.fetchone()
+            if not row:
+                raise HTTPException(404, "Ticker mention not found")
 
-        raw_symbol = row["symbol"]
+            raw_symbol = row["symbol"]
 
-        # Apply to ALL unresolved mentions of the same raw symbol across the entire DB
-        updated = conn.execute("""
-            UPDATE ticker_mentions
-            SET resolved_symbol=?, name=?, exchange=?, currency=?,
-                price_at_mention=COALESCE(price_at_mention, ?),
-                price_fetched_at=datetime('now')
-            WHERE symbol=? AND name='(unresolved)'
-        """, (symbol, name, exchange, currency, round(price, 4), raw_symbol)).rowcount
+            cur.execute("""
+                UPDATE ticker_mentions
+                SET resolved_symbol=%s, name=%s, exchange=%s, currency=%s,
+                    price_at_mention=COALESCE(price_at_mention, %s),
+                    price_fetched_at=%s
+                WHERE symbol=%s AND name='(unresolved)'
+            """, (symbol, name, exchange, currency, round(price, 4), db_now(), raw_symbol))
+            updated = cur.rowcount
 
-        # Also update the specific row even if it was already partially resolved
-        conn.execute("""
-            UPDATE ticker_mentions
-            SET resolved_symbol=?, name=?, exchange=?, currency=?,
-                price_fetched_at=datetime('now')
-            WHERE id=?
-        """, (symbol, name, exchange, currency, ticker_id))
+            cur.execute("""
+                UPDATE ticker_mentions
+                SET resolved_symbol=%s, name=%s, exchange=%s, currency=%s,
+                    price_fetched_at=%s
+                WHERE id=%s
+            """, (symbol, name, exchange, currency, db_now(), ticker_id))
 
-        conn.execute("""
-            INSERT INTO ticker_prices (resolved_symbol, current_price, currency, last_updated)
-            VALUES (?, ?, ?, datetime('now'))
-            ON CONFLICT(resolved_symbol) DO UPDATE SET
-                current_price = excluded.current_price,
-                last_updated  = excluded.last_updated
-        """, (symbol, round(price, 4), currency))
+            cur.execute("""
+                INSERT INTO ticker_prices (resolved_symbol, current_price, currency, last_updated)
+                VALUES (%s, %s, %s, %s)
+                ON CONFLICT (resolved_symbol) DO UPDATE SET
+                    current_price = EXCLUDED.current_price,
+                    last_updated  = EXCLUDED.last_updated
+            """, (symbol, round(price, 4), currency, db_now()))
+
+            cur.execute("""
+                DELETE FROM ticker_mentions
+                WHERE resolved_symbol = %s
+                  AND id NOT IN (
+                      SELECT MIN(id) FROM ticker_mentions
+                      WHERE resolved_symbol = %s
+                      GROUP BY signal_id
+                  )
+            """, (symbol, symbol))
 
     log.info(f"Resolved {raw_symbol!r} → {symbol} across {updated} mention(s)")
     return {"resolved_symbol": symbol, "name": name, "price": round(price, 4), "currency": currency, "mentions_updated": updated}
+
+
+# ── API: ticker signal history ────────────────────────────────────────────────
+
+@app.get("/api/tickers/{symbol}/signals")
+async def ticker_signal_history(symbol: str):
+    sym = symbol.upper()
+    with get_db() as conn:
+        with dict_cursor(conn) as cur:
+            cur.execute("""
+                SELECT s.id, s.tweet_id, s.thesis_summary, s.sentiment, s.confidence,
+                       t.url AS tweet_url, t.published_at,
+                       tm.price_at_mention, tm.currency, tm.change_pct,
+                       tp.current_price
+                FROM ticker_mentions tm
+                JOIN signals s ON tm.signal_id = s.id
+                JOIN tweets t ON s.tweet_id = t.id
+                LEFT JOIN ticker_prices tp ON tm.resolved_symbol = tp.resolved_symbol
+                WHERE tm.resolved_symbol = %s
+                  AND s.is_finance = 1
+                ORDER BY t.published_at DESC
+            """, (sym,))
+            rows = cur.fetchall()
+
+            cur.execute("""
+                SELECT name, exchange, currency FROM ticker_mentions
+                WHERE resolved_symbol = %s AND name != '(unresolved)'
+                LIMIT 1
+            """, (sym,))
+            info = cur.fetchone()
+
+    current_price = rows[0]["current_price"] if rows else None
+    currency = (info["currency"] if info else "") or ""
+
+    return {
+        "symbol": sym,
+        "name": info["name"] if info else sym,
+        "exchange": info["exchange"] if info else "",
+        "currency": currency,
+        "current_price": current_price,
+        "signals": [
+            {
+                "tweet_id": r["tweet_id"],
+                "tweet_url": r["tweet_url"],
+                "thesis_summary": r["thesis_summary"],
+                "sentiment": r["sentiment"],
+                "confidence": r["confidence"],
+                "published_at": r["published_at"],
+                "price_at_mention": r["price_at_mention"],
+                "currency": r["currency"] or currency,
+                "change_pct": r["change_pct"],
+                "current_price": r["current_price"],
+            }
+            for r in rows
+        ],
+    }
 
 
 # ── API: manual price refresh ─────────────────────────────────────────────────

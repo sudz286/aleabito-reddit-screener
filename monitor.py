@@ -17,11 +17,11 @@ import os
 import re
 import json
 import time
-import sqlite3
+import html
 import logging
 import argparse
 import hashlib
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from dataclasses import dataclass, field, asdict
 from typing import Optional
 from pathlib import Path
@@ -32,6 +32,7 @@ import yfinance as yf
 from anthropic import Anthropic
 from apify_client import ApifyClient
 from dotenv import load_dotenv
+from db import get_db, dict_cursor, db_now
 
 load_dotenv()
 
@@ -84,117 +85,178 @@ class Config:
 
     # State
     STATE_FILE = Path(__file__).parent / "state" / "last_seen.json"
-    DB_FILE = Path(__file__).parent / "state" / "signals.db"
 
 
 # ── Database ──────────────────────────────────────────────────────────────────
 
-def _get_db() -> sqlite3.Connection:
-    Config.DB_FILE.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(str(Config.DB_FILE))
-    conn.row_factory = sqlite3.Row
-    return conn
-
-
 def init_db():
-    with _get_db() as conn:
-        conn.executescript("""
-            CREATE TABLE IF NOT EXISTS tweets (
-                id           TEXT PRIMARY KEY,
-                username     TEXT NOT NULL,
-                text         TEXT NOT NULL,
-                url          TEXT,
-                published_at TEXT,
-                fetched_at   TEXT DEFAULT (datetime('now')),
-                source       TEXT,
-                is_reply     INTEGER DEFAULT 0,
-                parent_text  TEXT
-            );
-            CREATE TABLE IF NOT EXISTS signals (
-                id             INTEGER PRIMARY KEY AUTOINCREMENT,
-                tweet_id       TEXT UNIQUE REFERENCES tweets(id),
-                is_finance     INTEGER DEFAULT 0,
-                thesis_summary TEXT,
-                market_context TEXT,
-                sentiment      TEXT,
-                confidence     TEXT,
-                processed_at   TEXT DEFAULT (datetime('now'))
-            );
-            CREATE TABLE IF NOT EXISTS ticker_mentions (
-                id               INTEGER PRIMARY KEY AUTOINCREMENT,
-                signal_id        INTEGER REFERENCES signals(id),
-                symbol           TEXT NOT NULL,
-                resolved_symbol  TEXT,
-                name             TEXT,
-                exchange         TEXT,
-                currency         TEXT,
-                price_at_mention REAL,
-                change_pct       REAL,
-                price_fetched_at TEXT DEFAULT (datetime('now'))
-            );
-            CREATE TABLE IF NOT EXISTS ticker_prices (
-                resolved_symbol TEXT PRIMARY KEY,
-                current_price   REAL,
-                currency        TEXT,
-                last_updated    TEXT DEFAULT (datetime('now'))
-            );
-        """)
-    log.info(f"Database ready: {Config.DB_FILE}")
+    with get_db() as conn:
+        with dict_cursor(conn) as cur:
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS tweets (
+                    id           TEXT PRIMARY KEY,
+                    username     TEXT NOT NULL,
+                    text         TEXT NOT NULL,
+                    url          TEXT,
+                    published_at TEXT,
+                    fetched_at   TEXT,
+                    source       TEXT,
+                    is_reply     INTEGER DEFAULT 0,
+                    parent_text  TEXT
+                )
+            """)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS signals (
+                    id             SERIAL PRIMARY KEY,
+                    tweet_id       TEXT UNIQUE REFERENCES tweets(id),
+                    is_finance     INTEGER DEFAULT 0,
+                    thesis_summary TEXT,
+                    market_context TEXT,
+                    sentiment      TEXT,
+                    confidence     TEXT,
+                    processed_at   TEXT
+                )
+            """)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS ticker_mentions (
+                    id               SERIAL PRIMARY KEY,
+                    signal_id        INTEGER REFERENCES signals(id),
+                    symbol           TEXT NOT NULL,
+                    resolved_symbol  TEXT,
+                    name             TEXT,
+                    exchange         TEXT,
+                    currency         TEXT,
+                    price_at_mention REAL,
+                    change_pct       REAL,
+                    price_fetched_at TEXT
+                )
+            """)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS ticker_prices (
+                    resolved_symbol TEXT PRIMARY KEY,
+                    current_price   REAL,
+                    currency        TEXT,
+                    last_updated    TEXT,
+                    fail_count      INTEGER DEFAULT 0
+                )
+            """)
+
+    # Migrate: convert Twitter-format dates and decode HTML entities in existing rows
+    with get_db() as conn:
+        with dict_cursor(conn) as cur:
+            cur.execute(
+                "SELECT id, published_at FROM tweets WHERE published_at != '' AND published_at NOT LIKE '20%'"
+            )
+            for row in cur.fetchall():
+                iso = _parse_tweet_date(row["published_at"])
+                if iso != row["published_at"]:
+                    cur.execute("UPDATE tweets SET published_at = %s WHERE id = %s", (iso, row["id"]))
+
+            cur.execute(
+                "SELECT id, text FROM tweets WHERE text LIKE '%&amp;%' OR text LIKE '%&gt;%' OR text LIKE '%&lt;%'"
+            )
+            for row in cur.fetchall():
+                decoded = html.unescape(row["text"])
+                if decoded != row["text"]:
+                    cur.execute("UPDATE tweets SET text = %s WHERE id = %s", (decoded, row["id"]))
+
+    log.info("Database ready (PostgreSQL)")
+
+
+def _parse_tweet_date(raw: str) -> str:
+    """Normalize a Twitter-format date string to ISO 8601 for correct sorting."""
+    if not raw:
+        return raw
+    if re.match(r'^\d{4}-', raw):
+        return raw  # already ISO
+    try:
+        dt = datetime.strptime(raw, "%a %b %d %H:%M:%S %z %Y")
+        return dt.strftime("%Y-%m-%dT%H:%M:%S+00:00")
+    except ValueError:
+        pass
+    return raw
+
+
+def _get_historical_price(tk: "yf.Ticker", as_of_date: str) -> Optional[float]:
+    """Return the closing price on the trading day on or before as_of_date."""
+    try:
+        date = datetime.fromisoformat(as_of_date[:10])
+        start = (date - timedelta(days=7)).strftime("%Y-%m-%d")
+        end   = (date + timedelta(days=1)).strftime("%Y-%m-%d")
+        hist  = tk.history(start=start, end=end)
+        if not hist.empty:
+            return round(float(hist["Close"].iloc[-1]), 4)
+    except Exception:
+        pass
+    return None
 
 
 def is_tweet_seen(tweet_id: str) -> bool:
-    with _get_db() as conn:
-        return conn.execute(
-            "SELECT 1 FROM tweets WHERE id = ?", (tweet_id,)
-        ).fetchone() is not None
+    with get_db() as conn:
+        with dict_cursor(conn) as cur:
+            cur.execute("SELECT 1 FROM tweets WHERE id = %s", (tweet_id,))
+            return cur.fetchone() is not None
 
 
 def get_last_tweet_id() -> Optional[str]:
-    with _get_db() as conn:
-        row = conn.execute(
-            "SELECT id FROM tweets ORDER BY fetched_at DESC LIMIT 1"
-        ).fetchone()
-        return row["id"] if row else None
+    with get_db() as conn:
+        with dict_cursor(conn) as cur:
+            cur.execute("SELECT id FROM tweets ORDER BY fetched_at DESC LIMIT 1")
+            row = cur.fetchone()
+            return row["id"] if row else None
 
 
 def save_tweet_to_db(tweet: dict):
-    with _get_db() as conn:
-        conn.execute(
-            """INSERT OR IGNORE INTO tweets
-               (id, username, text, url, published_at, source, is_reply, parent_text)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
-            (
-                tweet["id"], Config.X_TARGET_USERNAME, tweet["text"],
-                tweet["url"], tweet["time"], Config.TWEET_SOURCE,
-                int(tweet["is_reply"]), tweet.get("parent_text", ""),
-            ),
-        )
+    with get_db() as conn:
+        with dict_cursor(conn) as cur:
+            cur.execute(
+                """INSERT INTO tweets
+                   (id, username, text, url, published_at, fetched_at, source, is_reply, parent_text)
+                   VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                   ON CONFLICT (id) DO NOTHING""",
+                (
+                    tweet["id"], Config.X_TARGET_USERNAME, tweet["text"],
+                    tweet["url"], tweet["time"], db_now(), Config.TWEET_SOURCE,
+                    int(tweet["is_reply"]), tweet.get("parent_text", ""),
+                ),
+            )
 
 
 def save_signal_to_db(signal: "Signal"):
-    with _get_db() as conn:
-        cur = conn.execute(
-            """INSERT OR REPLACE INTO signals
-               (tweet_id, is_finance, thesis_summary, market_context, sentiment, confidence)
-               VALUES (?, ?, ?, ?, ?, ?)""",
-            (
-                signal.tweet_id, int(signal.is_finance),
-                signal.thesis_summary, signal.market_context,
-                signal.sentiment, signal.confidence,
-            ),
-        )
-        signal_id = cur.lastrowid
-        for t in signal.tickers:
-            conn.execute(
-                """INSERT INTO ticker_mentions
-                   (signal_id, symbol, resolved_symbol, name, exchange, currency,
-                    price_at_mention, change_pct)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+    with get_db() as conn:
+        with dict_cursor(conn) as cur:
+            cur.execute(
+                """INSERT INTO signals
+                   (tweet_id, is_finance, thesis_summary, market_context,
+                    sentiment, confidence, processed_at)
+                   VALUES (%s, %s, %s, %s, %s, %s, %s)
+                   ON CONFLICT (tweet_id) DO UPDATE SET
+                       is_finance     = EXCLUDED.is_finance,
+                       thesis_summary = EXCLUDED.thesis_summary,
+                       market_context = EXCLUDED.market_context,
+                       sentiment      = EXCLUDED.sentiment,
+                       confidence     = EXCLUDED.confidence
+                   RETURNING id""",
                 (
-                    signal_id, t["symbol"], t["resolved_symbol"], t.get("name"),
-                    t.get("market"), t.get("currency"), t.get("price"), t.get("change_pct"),
+                    signal.tweet_id, int(signal.is_finance),
+                    signal.thesis_summary, signal.market_context,
+                    signal.sentiment, signal.confidence,
+                    db_now(),
                 ),
             )
+            signal_id = cur.fetchone()["id"]
+            for t in signal.tickers:
+                cur.execute(
+                    """INSERT INTO ticker_mentions
+                       (signal_id, symbol, resolved_symbol, name, exchange, currency,
+                        price_at_mention, change_pct, price_fetched_at)
+                       VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)""",
+                    (
+                        signal_id, t["symbol"], t["resolved_symbol"], t.get("name"),
+                        t.get("market"), t.get("currency"), t.get("price"), t.get("change_pct"),
+                        db_now(),
+                    ),
+                )
 
 
 # ── Data Models ───────────────────────────────────────────────────────────────
@@ -329,28 +391,32 @@ def search_yahoo_symbols(name: str) -> list[str]:
         return []
 
 
-def resolve_known_symbol(symbol: str, source_name: str) -> Optional[TickerInfo]:
+def resolve_known_symbol(symbol: str, source_name: str,
+                         as_of_date: str = None) -> Optional[TickerInfo]:
     """Validate and fetch price for an already-known yfinance symbol."""
     try:
         tk = yf.Ticker(symbol)
-        price = getattr(tk.fast_info, "last_price", None)
-        if price is not None and price > 0:
-            full_info = tk.info
-            return TickerInfo(
-                symbol=source_name,
-                resolved_symbol=symbol,
-                name=full_info.get("shortName", full_info.get("longName", symbol)),
-                price=round(price, 4),
-                currency=full_info.get("currency", ""),
-                market=full_info.get("exchange", ""),
-                change_pct=_calc_change(tk),
-            )
+        current = getattr(tk.fast_info, "last_price", None)
+        if current is None or current <= 0:
+            return None
+        price = (_get_historical_price(tk, as_of_date) or current) if as_of_date else current
+        full_info = tk.info
+        return TickerInfo(
+            symbol=source_name,
+            resolved_symbol=symbol,
+            name=full_info.get("shortName", full_info.get("longName", symbol)),
+            price=round(price, 4),
+            currency=full_info.get("currency", ""),
+            market=full_info.get("exchange", ""),
+            change_pct=_calc_change(tk),
+        )
     except Exception:
         pass
     return None
 
 
-def resolve_ticker(raw: str, market_hints: list[str]) -> Optional[TickerInfo]:
+def resolve_ticker(raw: str, market_hints: list[str],
+                   as_of_date: str = None) -> Optional[TickerInfo]:
     """
     Try to resolve a raw ticker symbol to a valid yfinance instrument.
 
@@ -363,17 +429,14 @@ def resolve_ticker(raw: str, market_hints: list[str]) -> Optional[TickerInfo]:
     candidates = []
 
     if is_numeric:
-        # Numeric tickers are almost always Asian (Korea, Japan, Taiwan, China)
         for suffix in market_hints:
             candidates.append(f"{raw}{suffix}")
-        # Default guesses for numeric if no context hints
         if not market_hints:
             candidates.extend([
                 f"{raw}.KS", f"{raw}.T", f"{raw}.TW",
                 f"{raw}.SS", f"{raw}.SZ", f"{raw}.HK",
             ])
     else:
-        # Alphanumeric: try US first, then hinted international markets
         candidates.append(raw.upper())
         for suffix in market_hints:
             candidates.append(f"{raw.upper()}{suffix}")
@@ -381,19 +444,20 @@ def resolve_ticker(raw: str, market_hints: list[str]) -> Optional[TickerInfo]:
     for candidate in candidates:
         try:
             tk = yf.Ticker(candidate)
-            info = tk.fast_info
-            price = getattr(info, "last_price", None)
-            if price is not None and price > 0:
-                full_info = tk.info
-                return TickerInfo(
-                    symbol=raw,
-                    resolved_symbol=candidate,
-                    name=full_info.get("shortName", full_info.get("longName", candidate)),
-                    price=round(price, 4),
-                    currency=full_info.get("currency", ""),
-                    market=full_info.get("exchange", ""),
-                    change_pct=_calc_change(tk),
-                )
+            current = getattr(tk.fast_info, "last_price", None)
+            if current is None or current <= 0:
+                continue
+            price = (_get_historical_price(tk, as_of_date) or current) if as_of_date else current
+            full_info = tk.info
+            return TickerInfo(
+                symbol=raw,
+                resolved_symbol=candidate,
+                name=full_info.get("shortName", full_info.get("longName", candidate)),
+                price=round(price, 4),
+                currency=full_info.get("currency", ""),
+                market=full_info.get("exchange", ""),
+                change_pct=_calc_change(tk),
+            )
         except Exception:
             continue
 
@@ -459,11 +523,11 @@ def fetch_tweets_rsshub(username: str, limit: int = 20) -> list[dict]:
 
         tweets.append({
             "id": tweet_id,
-            "text": plain_text,
+            "text": html.unescape(plain_text),
             "url": tweet_url,
-            "time": entry.get("published", ""),
+            "time": _parse_tweet_date(entry.get("published", "")),
             "is_reply": is_reply,
-            "parent_text": parent_text,
+            "parent_text": html.unescape(parent_text),
         })
 
     log.info(f"Fetched {len(tweets)} tweets via RSSHub")
@@ -538,10 +602,12 @@ def fetch_tweets_x_api(username: str, limit: int = 20, since_id: str = None) -> 
     return tweets
 
 
-def fetch_tweets_apify(username: str, limit: int = 20) -> list[dict]:
+def fetch_tweets_apify(username: str, limit: int = 20, until_date: str = None) -> list[dict]:
     """
     Fetch tweets via Apify's tweet-scraper actor.
     Uses apidojo/tweet-scraper by default (works on free tier).
+    until_date: ISO date string (e.g. "2026-04-01") — passed to Apify as toDate to
+    avoid fetching tweets already in the DB, saving API credits during seeding.
     """
     if not Config.APIFY_API_TOKEN:
         log.error("APIFY_API_TOKEN not set")
@@ -554,6 +620,9 @@ def fetch_tweets_apify(username: str, limit: int = 20) -> list[dict]:
         "startUrls": [{"url": f"https://twitter.com/{username}"}],
         "maxItems": limit,
     }
+    if until_date:
+        run_input["toDate"] = until_date[:10]  # YYYY-MM-DD
+        log.info(f"Apify toDate set to {run_input['toDate']} (fetching tweets before this date)")
 
     try:
         run = client.actor(Config.APIFY_ACTOR_ID).call(run_input=run_input)
@@ -583,9 +652,9 @@ def fetch_tweets_apify(username: str, limit: int = 20) -> list[dict]:
 
             tweets.append({
                 "id": tweet_id,
-                "text": text,
+                "text": html.unescape(text),
                 "url": url,
-                "time": created_at,
+                "time": _parse_tweet_date(created_at),
                 "is_reply": is_reply,
                 "parent_text": "",
             })
@@ -597,13 +666,13 @@ def fetch_tweets_apify(username: str, limit: int = 20) -> list[dict]:
     return tweets
 
 
-def fetch_tweets(limit: int = 20, since_id: str = None) -> list[dict]:
+def fetch_tweets(limit: int = 20, since_id: str = None, until_date: str = None) -> list[dict]:
     """Route to the configured tweet source."""
     username = Config.X_TARGET_USERNAME
     if Config.TWEET_SOURCE == "x_api":
         return fetch_tweets_x_api(username, limit, since_id)
     if Config.TWEET_SOURCE == "apify":
-        return fetch_tweets_apify(username, limit)
+        return fetch_tweets_apify(username, limit, until_date=until_date)
     return fetch_tweets_rsshub(username, limit)
 
 
@@ -679,17 +748,41 @@ def summarize_thesis(tweet_text: str, tickers: list[TickerInfo],
 
 # ── Signal Assembly ───────────────────────────────────────────────────────────
 
+_OTC_EXCHANGES = {"PNK", "OTC", "GREY", "PINX"}
+
+
+def _dedupe_by_primary_exchange(resolved: dict) -> dict:
+    """Drop OTC/pink-sheet duplicates when a primary-exchange listing exists for the same company."""
+    by_name: dict[str, list[str]] = {}
+    for sym, info in resolved.items():
+        key = (info.name or "").strip().lower()
+        if key and key != "(unresolved)":
+            by_name.setdefault(key, []).append(sym)
+
+    to_drop: set[str] = set()
+    for syms in by_name.values():
+        if len(syms) < 2:
+            continue
+        primary = [s for s in syms if resolved[s].market not in _OTC_EXCHANGES]
+        otc     = [s for s in syms if resolved[s].market in _OTC_EXCHANGES]
+        if primary and otc:
+            to_drop.update(otc)
+            log.info(f"Dropped OTC duplicates {otc} in favour of {primary}")
+
+    return {s: info for s, info in resolved.items() if s not in to_drop}
+
+
 def process_tweet(tweet: dict) -> Signal:
     """Full pipeline: extract tickers -> resolve prices -> Claude thesis + name extraction -> name resolution."""
-    text = tweet["text"]
-    full_context = text + " " + tweet.get("parent_text", "")
+    text = html.unescape(tweet["text"])
+    as_of_date = tweet.get("time", "")
+    full_context = text + " " + html.unescape(tweet.get("parent_text", ""))
     market_hints = detect_market_hints(full_context)
 
     # Pass 1: resolve $TICKER patterns from tweet text
-    # Use an ordered dict keyed by resolved_symbol to dedupe across both passes
     resolved: dict[str, TickerInfo] = {}
     for raw in extract_raw_tickers(text):
-        info = resolve_ticker(raw, market_hints)
+        info = resolve_ticker(raw, market_hints, as_of_date=as_of_date)
         if info:
             resolved[info.resolved_symbol] = info
         else:
@@ -707,12 +800,15 @@ def process_tweet(tweet: dict) -> Signal:
         candidates = search_yahoo_symbols(name)
         for symbol in candidates:
             if symbol in resolved:
-                break  # already have this one
-            info = resolve_known_symbol(symbol, source_name=name)
+                break
+            info = resolve_known_symbol(symbol, source_name=name, as_of_date=as_of_date)
             if info:
                 resolved[symbol] = info
                 log.info(f"Name-resolved '{name}' -> {symbol} ({info.name})")
-                break  # first valid match is enough per name
+                break
+
+    # Drop OTC/pink-sheet duplicates when a primary-exchange listing exists
+    resolved = _dedupe_by_primary_exchange(resolved)
 
     all_tickers = list(resolved.values())
     return Signal(
@@ -805,7 +901,7 @@ def run_once(backfill: int = 20, since: str = None, until: str = None):
     When provided, tweets outside the window are skipped (client-side filter,
     works for all sources). The X API source also passes since/until server-side.
     """
-    tweets = fetch_tweets(limit=backfill, since_id=get_last_tweet_id())
+    tweets = fetch_tweets(limit=backfill, since_id=get_last_tweet_id(), until_date=until)
     if not tweets:
         log.info("No new tweets found")
         return
@@ -850,6 +946,49 @@ def run_once(backfill: int = 20, since: str = None, until: str = None):
     log.info(f"Processed {len(tweets)} tweets, {new_signals} finance signals sent")
 
 
+def backfill_historical_prices():
+    """Update price_at_mention for all existing ticker_mentions using historical closing prices."""
+    with get_db() as conn:
+        with dict_cursor(conn) as cur:
+            cur.execute("""
+                SELECT tm.id, tm.resolved_symbol, t.published_at
+                FROM ticker_mentions tm
+                JOIN signals s ON tm.signal_id = s.id
+                JOIN tweets t ON s.tweet_id = t.id
+                WHERE tm.resolved_symbol IS NOT NULL
+                  AND tm.resolved_symbol != ''
+                  AND tm.name != '(unresolved)'
+                  AND t.published_at IS NOT NULL
+                  AND t.published_at != ''
+            """)
+            rows = cur.fetchall()
+
+    log.info(f"Backfilling historical prices for {len(rows)} ticker mentions…")
+    updated = failed = 0
+
+    for row in rows:
+        symbol   = row["resolved_symbol"]
+        date_str = row["published_at"]
+        try:
+            price = _get_historical_price(yf.Ticker(symbol), date_str)
+            if price and price > 0:
+                with get_db() as conn:
+                    with dict_cursor(conn) as cur:
+                        cur.execute(
+                            "UPDATE ticker_mentions SET price_at_mention = %s WHERE id = %s",
+                            (price, row["id"])
+                        )
+                updated += 1
+            else:
+                failed += 1
+                log.warning(f"No historical price for {symbol} on {date_str}")
+        except Exception as e:
+            log.warning(f"Historical price fetch failed for {symbol}: {e}")
+            failed += 1
+
+    log.info(f"Price backfill complete: {updated} updated, {failed} failed")
+
+
 def run_daemon():
     """Continuous polling loop."""
     log.info(f"Starting daemon, polling every {Config.POLL_INTERVAL_SECONDS}s")
@@ -870,6 +1009,8 @@ def main():
                         help="Only process tweets on/after this date (ISO format, e.g. 2026-01-01)")
     parser.add_argument("--until", type=str, default=None,
                         help="Only process tweets on/before this date (ISO format, e.g. 2026-05-01)")
+    parser.add_argument("--fix-prices", action="store_true",
+                        help="Backfill price_at_mention with historical closing prices (slow)")
     args = parser.parse_args()
 
     if args.source:
@@ -877,7 +1018,9 @@ def main():
 
     init_db()
 
-    if args.daemon:
+    if args.fix_prices:
+        backfill_historical_prices()
+    elif args.daemon:
         run_daemon()
     else:
         run_once(backfill=args.backfill, since=args.since, until=args.until)
